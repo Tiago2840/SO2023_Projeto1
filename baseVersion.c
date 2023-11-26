@@ -9,6 +9,9 @@
 #include <semaphore.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <signal.h>
+#include <errno.h>
+#include <sys/time.h>
 
 #define MAX_CITIES 20
 #define MAX_ITERATIONS 10000
@@ -17,6 +20,7 @@ typedef struct
 {
     int path[MAX_CITIES];
     int distance;
+    int total_iterations; // Added iteration counter
 } Solution;
 
 // Global variables
@@ -25,8 +29,9 @@ int *distance_matrix;
 Solution *shared_memory;
 sem_t *semaphore;
 int shm_id;
-int total_iterations = 0;
-double total_execution_time = 0.0;
+volatile sig_atomic_t update_signal = 0;
+pid_t child_processes[MAX_ITERATIONS];
+int num_child_processes = 0;
 
 // Function declarations
 void initialize_shared_memory();
@@ -38,6 +43,11 @@ void run_algorithm(int process_id, int num_processes, int max_time);
 
 int main(int argc, char *argv[])
 {
+    struct timeval start_time, end_time;
+
+    // Record the start time
+    gettimeofday(&start_time, NULL);
+
     if (argc != 4)
     {
         printf("Usage: %s <filename> <num_processes> <max_time>\n", argv[0]);
@@ -98,6 +108,16 @@ int main(int argc, char *argv[])
         wait(NULL);
     }
 
+    // Record the end time
+    gettimeofday(&end_time, NULL);
+
+    // Calculate total execution time in microseconds
+    long total_execution_time = (end_time.tv_sec - start_time.tv_sec) * 1000000 +
+                                (end_time.tv_usec - start_time.tv_usec);
+
+    // Convert to milliseconds
+    total_execution_time /= 1000;
+
     // Print the best solution found
     printf("Best solution found: ");
     for (int i = 0; i < num_cities; ++i)
@@ -105,6 +125,8 @@ int main(int argc, char *argv[])
         printf("%d ", shared_memory->path[i]);
     }
     printf("\nDistance: %d\n", shared_memory->distance);
+    printf("Total iterations across all processes: %d\n", shared_memory->total_iterations);
+    printf("Total execution time: %ld ms\n", total_execution_time);
 
     // Clean up
     free(distance_matrix);
@@ -133,6 +155,7 @@ void initialize_shared_memory()
 
     // Initialize distance to a large value
     shared_memory->distance = 100000;
+    shared_memory->total_iterations = 0; // Initialize iteration counter
 
     // Initialize semaphore
     semaphore = sem_open("/my_semaphore", O_CREAT | O_EXCL, 0666, 1);
@@ -208,6 +231,7 @@ void update_shared_memory(Solution *solution)
     if (solution->distance < shared_memory->distance || shared_memory->distance == 0)
     {
         *shared_memory = *solution;
+        shared_memory->total_iterations += solution->total_iterations;
         printf("Updated shared memory. New distance: %d\n", shared_memory->distance);
     }
 
@@ -225,6 +249,7 @@ void run_algorithm(int process_id, int num_processes, int max_time)
     // Initialize the current solution with a random path
     generate_random_path(current_solution.path, num_cities);
     current_solution.distance = calculate_distance(current_solution.path);
+    current_solution.total_iterations = 0; // Initialize local iteration counter
     printf("Initial shared memory distance: %d\n", shared_memory->distance);
 
     while (iteration < MAX_ITERATIONS && difftime(time(NULL), start_time) < max_time)
@@ -242,10 +267,11 @@ void run_algorithm(int process_id, int num_processes, int max_time)
             // You may want to update other information in the solution as well
         }
 
+        // Increment the local iteration counter
+        iteration++;
+        current_solution.total_iterations = iteration;
+
         // Update the shared memory if the current solution is better
         update_shared_memory(&current_solution);
-
-        // Increment the iteration counter
-        iteration++;
     }
 }
