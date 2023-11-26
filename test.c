@@ -9,9 +9,13 @@
 #include <semaphore.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <signal.h>
+#include <errno.h>
+#include <sys/time.h>
 
 #define MAX_CITIES 20
-#define MAX_ITERATIONS 10000
+#define MAX_ITERATIONS 1000000
+#define MAX_PROCESSES 100
 
 typedef struct
 {
@@ -25,8 +29,9 @@ int *distance_matrix;
 Solution *shared_memory;
 sem_t *semaphore;
 int shm_id;
-int total_iterations = 0;
-double total_execution_time = 0.0;
+volatile sig_atomic_t update_signal = 0;
+pid_t child_processes[MAX_PROCESSES];
+int num_child_processes = 0;
 
 // Function declarations
 void initialize_shared_memory();
@@ -35,6 +40,7 @@ int calculate_distance(int *path);
 void exchange_mutation(int *path);
 void update_shared_memory(Solution *solution);
 void run_algorithm(int process_id, int num_processes, int max_time);
+void handle_update_signal(int signo);
 
 int main(int argc, char *argv[])
 {
@@ -73,6 +79,13 @@ int main(int argc, char *argv[])
     // Initialize shared memory and semaphore
     initialize_shared_memory();
 
+    // Attach the signal handler
+    if (signal(SIGUSR1, handle_update_signal) == SIG_ERR)
+    {
+        perror("Error attaching signal handler");
+        exit(EXIT_FAILURE);
+    }
+
     // Create processes
     for (int i = 0; i < num_processes; ++i)
     {
@@ -90,13 +103,33 @@ int main(int argc, char *argv[])
             run_algorithm(i, num_processes, max_time);
             exit(EXIT_SUCCESS);
         }
+        else
+        {
+            // Parent process
+            child_processes[num_child_processes++] = pid;
+        }
     }
+
+    struct timeval start_time, end_time;
+
+    // Record the start time
+    gettimeofday(&start_time, NULL);
 
     // Wait for all child processes to finish
     for (int i = 0; i < num_processes; ++i)
     {
         wait(NULL);
     }
+
+    // Record the end time
+    gettimeofday(&end_time, NULL);
+
+    // Calculate total execution time in microseconds
+    long total_execution_time = (end_time.tv_sec - start_time.tv_sec) * 1000000 +
+                                (end_time.tv_usec - start_time.tv_usec);
+
+    // Convert to milliseconds
+    total_execution_time /= 1000;
 
     // Print the best solution found
     printf("Best solution found: ");
@@ -105,6 +138,7 @@ int main(int argc, char *argv[])
         printf("%d ", shared_memory->path[i]);
     }
     printf("\nDistance: %d\n", shared_memory->distance);
+    printf("Total execution time: %ld ms\n", total_execution_time);
 
     // Clean up
     free(distance_matrix);
@@ -209,9 +243,26 @@ void update_shared_memory(Solution *solution)
     {
         *shared_memory = *solution;
         printf("Updated shared memory. New distance: %d\n", shared_memory->distance);
+        kill(getppid(), SIGUSR1);
     }
 
     sem_post(semaphore);
+}
+
+void handle_update_signal(int signo)
+{
+    if (signo == SIGUSR1)
+    {
+        update_signal = 1;
+    }
+
+    for (int i = 0; i < num_child_processes; ++i)
+    {
+        kill(child_processes[i], SIGUSR1);
+    }
+
+    // Introduce a small delay to allow signals to be processed
+    usleep(10000);
 }
 
 void run_algorithm(int process_id, int num_processes, int max_time)
@@ -227,8 +278,33 @@ void run_algorithm(int process_id, int num_processes, int max_time)
     current_solution.distance = calculate_distance(current_solution.path);
     printf("Initial shared memory distance: %d\n", shared_memory->distance);
 
+    // Flag to track if synchronization has occurred in the current iteration
+    int synchronized_this_iteration = 0;
+
     while (iteration < MAX_ITERATIONS && difftime(time(NULL), start_time) < max_time)
     {
+        // If an update signal is received and not synchronized in the current iteration,
+        // synchronize paths and resume activity
+        if (update_signal && !synchronized_this_iteration)
+        {
+            sem_wait(semaphore);
+
+            // Synchronize paths with the shared memory
+            for (int i = 0; i < num_cities; ++i)
+            {
+                current_solution.path[i] = shared_memory->path[i];
+            }
+            current_solution.distance = shared_memory->distance;
+
+            sem_post(semaphore);
+
+            printf("Process %d synchronized with updated path. New distance: %d\n", process_id, current_solution.distance);
+
+            // Reset the update signal and set the flag
+            update_signal = 0;
+            synchronized_this_iteration = 1;
+        }
+
         // Apply mutation (exchange mutation)
         exchange_mutation(current_solution.path);
 
@@ -239,11 +315,16 @@ void run_algorithm(int process_id, int num_processes, int max_time)
         if (mutated_distance < current_solution.distance)
         {
             current_solution.distance = mutated_distance;
-            // You may want to update other information in the solution as well
         }
 
         // Update the shared memory if the current solution is better
         update_shared_memory(&current_solution);
+
+        // If synchronized in the current iteration, set the flag to 0
+        if (synchronized_this_iteration)
+        {
+            synchronized_this_iteration = 0;
+        }
 
         // Increment the iteration counter
         iteration++;
