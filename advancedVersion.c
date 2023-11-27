@@ -12,9 +12,10 @@
 #include <signal.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <sys/mman.h>
 
 #define MAX_CITIES 20
-#define MAX_ITERATIONS 1000000
+#define MAX_ITERATIONS 1000000000
 #define MAX_PROCESSES 100
 
 typedef struct
@@ -34,129 +35,17 @@ int shm_id;
 volatile sig_atomic_t update_signal = 0;
 pid_t child_processes[MAX_PROCESSES];
 int num_child_processes = 0;
-struct timeval start_program_time; // Added variable
-Solution best_solution;            // Declare best_solution variable
-
-// Function declarations
-void initialize_shared_memory();
-void generate_random_path(int *path, int size);
-int calculate_distance(int *path);
-void exchange_mutation(int *path);
-void update_shared_memory(Solution *solution);
-void run_algorithm(int process_id, int num_processes, int max_time);
-void handle_update_signal(int signo);
-long get_elapsed_time(); // Added function
-
-int main(int argc, char *argv[])
-{
-    if (argc != 4)
-    {
-        printf("Usage: %s <filename> <num_processes> <max_time>\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
-
-    // Parse command line arguments
-    char *filename = argv[1];
-    int num_processes = atoi(argv[2]);
-    int max_time = atoi(argv[3]);
-
-    // Read distance matrix from file
-    FILE *file = fopen(filename, "r");
-    if (!file)
-    {
-        perror("Error opening file");
-        exit(EXIT_FAILURE);
-    }
-
-    fscanf(file, "%d", &num_cities);
-
-    distance_matrix = (int *)malloc(num_cities * num_cities * sizeof(int));
-    for (int i = 0; i < num_cities; ++i)
-    {
-        for (int j = 0; j < num_cities; ++j)
-        {
-            fscanf(file, "%d", &distance_matrix[i * num_cities + j]);
-        }
-    }
-
-    fclose(file);
-
-    // Initialize best_solution
-    best_solution.distance = 100000;
-    best_solution.total_iterations = 0;
-    best_solution.process_id = -1; // Some invalid process ID to indicate uninitialized state
-    // Initialize path with some values (you can adjust this based on your requirements)
-    for (int i = 0; i < MAX_CITIES; ++i)
-    {
-        best_solution.path[i] = i + 1;
-    }
-
-    // Initialize shared memory and semaphore
-    initialize_shared_memory();
-
-    // Attach the signal handler
-    if (signal(SIGUSR1, handle_update_signal) == SIG_ERR)
-    {
-        perror("Error attaching signal handler");
-        exit(EXIT_FAILURE);
-    }
-
-    // Record the start time of the program
-    gettimeofday(&start_program_time, NULL);
-
-    // Create processes
-    for (int i = 0; i < num_processes; ++i)
-    {
-        pid_t pid = fork();
-
-        if (pid == -1)
-        {
-            perror("Error creating process");
-            exit(EXIT_FAILURE);
-        }
-
-        if (pid == 0)
-        {
-            // Child process
-            run_algorithm(i, num_processes, max_time);
-            exit(EXIT_SUCCESS);
-        }
-        else
-        {
-            // Parent process
-            child_processes[num_child_processes++] = pid;
-        }
-    }
-
-    // Wait for all child processes to finish
-    for (int i = 0; i < num_processes; ++i)
-    {
-        wait(NULL);
-    }
-
-    // Calculate total execution time in milliseconds
-    long total_execution_time = get_elapsed_time();
-
-    // Print the best solution found
-    printf("Best solution found by Process %d with %d iterations\n", shared_memory->process_id, shared_memory->total_iterations);
-    printf("Path: ");
-    for (int i = 0; i < num_cities; ++i)
-    {
-        printf("%d ", shared_memory->path[i]);
-    }
-    printf("\nDistance: %d\n", shared_memory->distance);
-    printf("Total execution time: %ld ms\n", total_execution_time);
-
-    // Clean up
-    free(distance_matrix);
-    shmdt(shared_memory);
-    shmctl(shm_id, IPC_RMID, NULL);
-
-    return 0;
-}
+struct timeval start_program_time, *current_time, best_time;
+Solution best_solution;
+int synchronized_this_iteration = 0;
 
 void initialize_shared_memory()
 {
+    int sem_protection = PROT_READ | PROT_WRITE;
+    int sem_visibility = MAP_ANONYMOUS | MAP_SHARED;
+
+    current_time = mmap(NULL, sizeof(struct timeval), sem_protection, sem_visibility, 0, 0);
+
     key_t key = ftok(".", 'a');
     shm_id = shmget(key, sizeof(Solution), IPC_CREAT | 0666);
     if (shm_id == -1)
@@ -246,14 +135,27 @@ void update_shared_memory(Solution *solution)
 {
     sem_wait(semaphore);
 
-    if (solution->distance < shared_memory->distance || shared_memory->distance == 0)
+    // Check if the distance is strictly less than the shared memory distance
+    // and if the total iterations have increased
+    if (solution->distance < shared_memory->distance || solution->total_iterations > shared_memory->total_iterations)
     {
         *shared_memory = *solution;
-        printf("Updated shared memory. New distance: %d\n", shared_memory->distance);
+        // NOTE: printf("Updated shared memory. New distance: %d\n", shared_memory->distance);
         kill(getppid(), SIGUSR1);
+        synchronized_this_iteration = 1; // Set the flag
     }
 
     sem_post(semaphore);
+}
+
+void synchronize_processes()
+{
+    for (int i = 0; i < num_child_processes; ++i)
+    {
+        kill(child_processes[i], SIGUSR1);
+    }
+    // Introduce a small delay to allow signals to be processed
+    usleep(10000);
 }
 
 void handle_update_signal(int signo)
@@ -263,13 +165,24 @@ void handle_update_signal(int signo)
         update_signal = 1;
     }
 
-    for (int i = 0; i < num_child_processes; ++i)
+    // Only synchronize if the flag is set
+    if (synchronized_this_iteration)
     {
-        kill(child_processes[i], SIGUSR1);
+        synchronize_processes();
+        synchronized_this_iteration = 0; // Reset the flag
     }
+}
 
-    // Introduce a small delay to allow signals to be processed
-    usleep(10000);
+// Function to get the elapsed time in milliseconds
+long get_elapsed_time()
+{
+    struct timeval current_time;
+    gettimeofday(&current_time, NULL);
+
+    long elapsed_time = (current_time.tv_sec - start_program_time.tv_sec) * 1000000 +
+                        (current_time.tv_usec - start_program_time.tv_usec);
+
+    return elapsed_time / 1000; // Convert to milliseconds
 }
 
 void run_algorithm(int process_id, int num_processes, int max_time)
@@ -287,12 +200,10 @@ void run_algorithm(int process_id, int num_processes, int max_time)
     current_solution.process_id = process_id; // Set process_id
     current_solution.total_iterations = 0;    // Initialize total iterations
 
-    printf("Initial shared memory distance: %d\n", shared_memory->distance);
+    // printf("Initial shared memory distance: %d\n", shared_memory->distance);
 
-    // Flag to track if synchronization has occurred in the current iteration
-    int synchronized_this_iteration = 0;
-
-    while (iteration < MAX_ITERATIONS && difftime(time(NULL), start_time) < max_time)
+    // while (iteration < MAX_ITERATIONS && difftime(time(NULL), start_time) < max_time)
+    while (difftime(time(NULL), start_time) < max_time)
     {
         // If an update signal is received and not synchronized in the current iteration,
         // synchronize paths and resume activity
@@ -340,31 +251,138 @@ void run_algorithm(int process_id, int num_processes, int max_time)
         if (current_solution.distance < best_solution.distance)
         {
             best_solution = current_solution;
+
+            gettimeofday(current_time, NULL);
         }
     }
 
-    // Print the best solution found and the time it took at the end
-    if (best_solution.process_id == process_id)
-    {
-        printf("Best solution found by Process %d with %d iterations\n", best_solution.process_id, best_solution.total_iterations);
-        printf("Path: ");
-        for (int i = 0; i < num_cities; ++i)
-        {
-            printf("%d ", best_solution.path[i]);
-        }
-        printf("\nDistance: %d\n", best_solution.distance);
-        printf("Time from start: %ld ms\n", get_elapsed_time());
-    }
+    // // Print the best solution found and the time it took at the end
+    // if (best_solution.process_id == process_id)
+    // {
+    //     printf("Best solution found by Process %d with %d iterations\n", best_solution.process_id, best_solution.total_iterations);
+    //     printf("Path: ");
+    //     for (int i = 0; i < num_cities; ++i)
+    //     {
+    //         printf("%d ", best_solution.path[i]);
+    //     }
+    //     printf("\nDistance: %d\n", best_solution.distance);
+    //     printf("Time from start: %ld ms\n", get_elapsed_time());
+    // }
 }
 
-// Function to get the elapsed time in milliseconds
-long get_elapsed_time()
+int main(int argc, char *argv[])
 {
-    struct timeval current_time;
-    gettimeofday(&current_time, NULL);
+    // Record the start time of the program
+    gettimeofday(&start_program_time, NULL);
 
-    long elapsed_time = (current_time.tv_sec - start_program_time.tv_sec) * 1000000 +
-                        (current_time.tv_usec - start_program_time.tv_usec);
+    if (argc != 4)
+    {
+        printf("Usage: %s <filename> <num_processes> <max_time>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
 
-    return elapsed_time / 1000; // Convert to milliseconds
+    // Parse command line arguments
+    char *filename = argv[1];
+    int num_processes = atoi(argv[2]);
+    int max_time = atoi(argv[3]);
+
+    // Read distance matrix from file
+    FILE *file = fopen(filename, "r");
+    if (!file)
+    {
+        perror("Error opening file");
+        exit(EXIT_FAILURE);
+    }
+
+    fscanf(file, "%d", &num_cities);
+
+    distance_matrix = (int *)malloc(num_cities * num_cities * sizeof(int));
+    for (int i = 0; i < num_cities; ++i)
+    {
+        for (int j = 0; j < num_cities; ++j)
+        {
+            fscanf(file, "%d", &distance_matrix[i * num_cities + j]);
+        }
+    }
+
+    fclose(file);
+
+    // Initialize best_solution
+    best_solution.distance = 100000;
+    best_solution.total_iterations = 0;
+    best_solution.process_id = -1; // Some invalid process ID to indicate uninitialized state
+    for (int i = 0; i < MAX_CITIES; ++i)
+    {
+        best_solution.path[i] = i + 1;
+    }
+
+    // Initialize shared memory and semaphore
+    initialize_shared_memory();
+
+    // Attach the signal handler
+    if (signal(SIGUSR1, handle_update_signal) == SIG_ERR)
+    {
+        perror("Error attaching signal handler");
+        exit(EXIT_FAILURE);
+    }
+
+    // Create processes
+    for (int i = 0; i < num_processes; ++i)
+    {
+        pid_t pid = fork();
+
+        if (pid == -1)
+        {
+            perror("Error creating process");
+            exit(EXIT_FAILURE);
+        }
+
+        if (pid == 0)
+        {
+            // Child process
+            run_algorithm(i, num_processes, max_time);
+            exit(EXIT_SUCCESS);
+        }
+        else
+        {
+            // Parent process
+            child_processes[num_child_processes++] = pid;
+        }
+    }
+
+    // Wait for all child processes to finish
+    for (int i = 0; i < num_processes; ++i)
+    {
+        wait(NULL);
+    }
+
+    printf("\n*** Advanced Version ***\n");
+    // Print the best solution found and the time it took
+    printf("Best solution found by Process %d with %d iterations\n", shared_memory->process_id, shared_memory->total_iterations);
+
+    // printf("Current time = %ld \nStart program time = %ld \nBest time: %ld\n",
+    //    current_time->tv_usec, start_program_time.tv_usec, best_time.tv_usec);
+
+    timersub(current_time, &start_program_time, &best_time);
+    long best_time_ms = best_time.tv_sec * 1000 + best_time.tv_usec / 1000; // Convert to milliseconds
+    printf("Best Time = %ld ms\n", best_time_ms);
+
+    printf("Path: ");
+    for (int i = 0; i < num_cities; ++i)
+    {
+        printf("%d ", shared_memory->path[i]);
+    }
+    printf("\nDistance: %d\n", shared_memory->distance);
+
+    // Calculate total execution time in milliseconds
+    long total_execution_time = get_elapsed_time();
+    printf("Total execution time: %ld ms\n", total_execution_time);
+    printf("\n\n");
+
+    // Clean up
+    free(distance_matrix);
+    shmdt(shared_memory);
+    shmctl(shm_id, IPC_RMID, NULL);
+
+    return 0;
 }

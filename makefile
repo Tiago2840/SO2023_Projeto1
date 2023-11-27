@@ -1,4 +1,4 @@
-# Functions to build the code files
+# Commands to build the code files
 buildbase:
 	gcc -o BaseVersion baseVersion.c
 
@@ -8,25 +8,27 @@ buildadvanced:
 buildoriginal:
 	gcc -o OriginalVersion originalVersion.c
 
-buildall: 
-	buildbase buildadvanced buildoriginal
+buildall: buildbase buildadvanced buildoriginal
 
-# Functions to run a quick test
+# Commands to run a quick test
 base:
-	./BaseVersion distancias.txt 10 60
+	./BaseVersion ./testfiles/ex8.txt 10 3
 	
 advanced:
-	./AdvancedVersion distancias.txt 10 60
+	./AdvancedVersion ./testfiles/ex8.txt 10 3
 
 original:
-	./OriginalVersion distancias.txt 10 60
+	./OriginalVersion ./testfiles/ex8.txt 10 3
 
-# Functions to build and run
-execbase:
-	buildbase base
+# Commands to build and run
+execbase: buildbase base
 
-execadvanced:
-	buildadvanced advanced
+execadvanced: buildadvanced advanced
 
-execoriginal:
-	buildoriginal original
+execoriginal: buildoriginal original
+
+execall: execbase execadvanced execoriginal
+
+# Command to clean up the compiled files
+clean:
+	rm -f BaseVersion AdvancedVersion OriginalVersion
