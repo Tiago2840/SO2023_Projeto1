@@ -12,13 +12,13 @@ buildall: buildbase buildadvanced buildoriginal
 
 # Commands to run a quick test
 base:
-	./BaseVersion ./testfiles/ex8.txt 10 3
-	
+	./BaseVersion ./testfiles/ex5.txt 10 1
+
 advanced:
-	./AdvancedVersion ./testfiles/ex8.txt 10 3
+	./AdvancedVersion ./testfiles/ex5.txt 10 1
 
 original:
-	./OriginalVersion ./testfiles/ex8.txt 10 3
+	./OriginalVersion ./testfiles/ex5.txt 10 1
 
 # Commands to build and run
 execbase: buildbase base
